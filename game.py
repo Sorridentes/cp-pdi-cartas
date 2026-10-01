@@ -6,6 +6,16 @@ import logging
 LIMIAR_CORTE = 8.0
 logger = logging.getLogger(__name__)
 
+# Mapeamento de valores das cartas para a soma do jogo
+VALORES = {'A': 1, 'J': 10, 'Q': 10, 'K': 10, '10': 10, **{str(n): n for n in range(2, 10)}}
+
+def obter_valor_carta(nome_template):
+    """Extrai a pontuação da carta com base no nome do template."""
+    for chave in sorted(VALORES.keys(), key=len, reverse=True):
+        if nome_template.startswith(chave):
+            return VALORES[chave]
+    return 0
+
 def carregarTemplates(sift_detector, templates_directory):
     template_data = []
     logger.info("Procurando templates em: %s", templates_directory)
@@ -65,9 +75,6 @@ def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
         if m.distance < ratio * n.distance and (m.queryIdx, m.trainIdx) in ids_mutuos:
             bons.append(m)
 
-    logger.debug("\t[%s] knn=%d | mutuos=%d | bons(crosscheck+ratio)=%d | min=%d",
-                 template_name, len(knn), len(mutuos), len(bons), min_matches)
-
     if len(bons) < min_matches:
         return 0
 
@@ -76,16 +83,10 @@ def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
 
     indices = list(range(len(bons)))
     caixas_globais = caixas_globais if caixas_globais is not None else []
-    n_kp_tpl = len(kp_template)
-    LIMIAR_SEGUINTE = 0.25                           # era 0.5
-    TAXA_MIN = 0.4                                  # era 0.55      # 50% do primeiro é suficiente
+    TAXA_MIN = 0.4
 
     primeira_inst = True
-    
-    inliers_primeira = None
     n_inst = 0
-    inliers_da_primeira = None
-    PALETA = [(0,255,0),(0,0,255),(255,0,0),(0,255,255),(255,0,255),(255,255,0)]
 
     while len(indices) >= min_matches:
         src_pts = src_all[indices].reshape(-1,1,2)
@@ -93,33 +94,24 @@ def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
 
         H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransac_thresh)
         if H is None or mask is None:
-            logger.debug("\t\t[%s] H=None, interrompendo busca.", template_name)
             break
 
         inliers = mask.ravel().astype(bool)
         n_in = int(inliers.sum())
         if n_in < min_matches:
-            logger.debug("\t\t[%s] inliers=%d < min_matches=%d, interrompendo busca.",
-                         template_name, n_in, min_matches)
             break
 
         taxa_inliers = n_in / max(1, len(src_pts))
         if taxa_inliers < TAXA_MIN:
-            logger.debug("\t\t[%s] taxa de inliers baixa (%.2f), ignorando.",
-                         template_name, taxa_inliers)
             break
         
         if primeira_inst:
-            inliers_primeira = n_in
             primeira_inst = False
         else:
-            # aqui o IoU já bloqueia o espelhamento 180°
             if n_in < 0.15 * len(bons):
-
                 break
-        ok = homografia_plausivel(H, template_img, img.shape, 
-                                  debug=True)
-        logger.debug("\t\t[%s] geom_ok=%s", template_name, ok)
+
+        ok = homografia_plausivel(H, template_img, img.shape, debug=True)
         if not ok:
             break
 
@@ -131,27 +123,18 @@ def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
         box = (corners[:,0].min(), corners[:,1].min(),
                corners[:,0].max(), corners[:,1].max())
         
-        # ⬇️ NMS GLOBAL: compara com TUDO já aceito
+        # NMS GLOBAL: compara com tudo já aceito
         sobreposto = False
-        
         for (b_old, name_old, inl_old) in caixas_globais:
-            i = iou(box, b_old)
-            logger.debug("\t\tIoU com %s: %.2f", name_old, i)
-            if i > 0.12:
+            if iou(box, b_old) > 0.12:
                 sobreposto = True
                 break
 
         if sobreposto:
-            # remove esses inliers e continua procurando outra carta igual de verdade
             indices = [indices[i] for i in range(len(indices)) if not inliers[i]]
-            logger.debug("\t\tBox %s descartado por sobreposição.", box)
             continue
-        logger.debug("\t\tNovo box: %s", box)
 
         caixas_globais.append((box, template_name, n_in))
-        cor = PALETA[n_inst % len(PALETA)]
-        desenhaContorno_com_H(H, template_img, img, cor,
-                              label=f"{template_name}#{n_inst+1}")
         n_inst += 1
 
         indices = [indices[i] for i in range(len(indices)) if not inliers[i]]
@@ -163,18 +146,15 @@ def homografia_plausivel(H, template_img, scene_shape, debug=False):
     pts = np.float32([[0,0],[w,0],[w,h],[0,h]]).reshape(-1,1,2)
     dst = cv2.perspectiveTransform(pts, H).reshape(-1,2)
 
-    # ⬇️ teste de convexidade tolerante: só rejeita se MUITO ruim
     area = abs(cv2.contourArea(dst.astype(np.float32)))
     hull = cv2.convexHull(dst.astype(np.float32))
     area_hull = abs(cv2.contourArea(hull))
     solidez = area / (area_hull + 1e-6)
-    if debug: logger.debug("\t\tGeometria: solidez=%.2f", solidez)
-    if solidez < 0.55:               # era isContourConvex (muito rígido)
+    if solidez < 0.55:
         return False
 
     ratio_area = area / (w * h)
-    if not (0.25 < ratio_area < 4.0):   # folga que combinamos
-        if debug: logger.debug("\t\tGeometria: area_ratio=%.2f", ratio_area)
+    if not (0.25 < ratio_area < 4.0):
         return False
 
     def side(p, q): return np.linalg.norm(q - p)
@@ -184,30 +164,12 @@ def homografia_plausivel(H, template_img, scene_shape, debug=False):
         return False
     ar = (w_det / h_det) / (w / h)
     if not (0.5 < ar < 2.0):
-        if debug: logger.debug("\t\tGeometria: ar=%.2f", ar)
         return False
 
     ih, iw = scene_shape[:2]
     if dst[:,0].min() < -50 or dst[:,0].max() > iw + 50: return False
     if dst[:,1].min() < -50 or dst[:,1].max() > ih + 50: return False
     return True
-
-
-def desenhaContorno_com_H(H, template_img, img, cor, label=""):
-    """Desenha o contorno de UMA instância usando a homografia já calculada."""
-    if H is None:
-        return
-    h, w = template_img.shape[:2]
-    pts = np.float32([[0, 0], [0, h], [w, h], [w, 0]]).reshape(-1, 1, 2)
-    dst = cv2.perspectiveTransform(pts, H)
-    cv2.polylines(img, [np.int32(dst)], True, cor, 3)
-
-    # desenha o nome da carta no centro
-    if label:
-        cx = int(dst[:, 0, 0].mean())
-        cy = int(dst[:, 0, 1].mean())
-        cv2.putText(img, label, (cx - 30, cy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, cor, 2)
 
 def iou(box1, box2):
     x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
@@ -219,11 +181,78 @@ def iou(box1, box2):
 
 def min_matches_para(n_kp_tpl):
     if n_kp_tpl <= 50:
-        return 5      # templates pequenos: aceita menos
+        return 5
     elif n_kp_tpl < 150:
-        return 6      # templates médios
+        return 6
     else:
-        return 8      # templates grandes: exige mais
+        return 8
+
+def determinar_vencedor(soma_jogador1, soma_jogador2, tem_cartas=True):
+    if not tem_cartas:
+        return "Aguardando cartas"
+    if soma_jogador1 > 21 and soma_jogador2 > 21:
+        return "Ambos passaram de 21"
+    if soma_jogador1 > 21:
+        return "Vencedor: Jogador 2"
+    if soma_jogador2 > 21:
+        return "Vencedor: Jogador 1"
+    if soma_jogador1 == 21 and soma_jogador2 == 21:
+        return "Empate: ambos fizeram 21"
+    if soma_jogador1 == 21:
+        return "Vencedor: Jogador 1"
+    if soma_jogador2 == 21:
+        return "Vencedor: Jogador 2"
+    if soma_jogador1 == soma_jogador2:
+        return "Empate"
+    vencedor = 1 if soma_jogador1 > soma_jogador2 else 2
+    return f"Vencedor: Jogador {vencedor}"
+
+
+def desenhar_placar_no_frame(img, caixas_globais):
+    altura, largura = img.shape[:2]
+    meio = largura // 2
+    cartas_por_jogador = [[], []]
+
+    for caixa, nome, _ in caixas_globais:
+        centro_x = (caixa[0] + caixa[2]) / 2
+        jogador = 0 if centro_x < meio else 1
+        cartas_por_jogador[jogador].append(nome)
+
+    somas = [
+        sum(obter_valor_carta(nome) for nome in cartas)
+        for cartas in cartas_por_jogador
+    ]
+    resultado = determinar_vencedor(somas[0], somas[1], bool(caixas_globais))
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (10, 10), (largura - 10, 155), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
+    cv2.line(img, (meio, 0), (meio, altura), (0, 255, 255), 2)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    padding = 24
+    largura_texto = max(1, meio - 2 * padding)
+
+    for indice, cartas in enumerate(cartas_por_jogador):
+        x = padding if indice == 0 else meio + padding
+        nome_jogador = f"Jogador {indice + 1}"
+        nomes_exibidos = [nome.split('_', 1)[0] for nome in cartas]
+        texto_cartas = "Cartas: " + (" + ".join(nomes_exibidos) if cartas else "Nenhuma")
+        largura_cartas = cv2.getTextSize(texto_cartas, font, 0.75, 2)[0][0]
+        escala_cartas = min(0.75, 0.75 * largura_texto / max(1, largura_cartas))
+
+        cv2.putText(img, nome_jogador, (x, 42), font, 0.85,
+                    (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, texto_cartas, (x, 78), font, escala_cartas,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, f"Soma: {somas[indice]}", (x, 112), font, 0.75,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+    cor_resultado = (0, 255, 0) if resultado.startswith("Vencedor") else (0, 200, 255)
+    largura_resultado = cv2.getTextSize(resultado, font, 0.8, 2)[0][0]
+    x_resultado = max(12, (largura - largura_resultado) // 2)
+    cv2.putText(img, resultado, (x_resultado, 145), font, 0.8,
+                cor_resultado, 2, cv2.LINE_AA)
 
 def process_frame(frame, sift_detector, template_data):
     img = frame.copy()
@@ -245,18 +274,14 @@ def process_frame(frame, sift_detector, template_data):
     area = cv2.erode(area, np.ones((9, 9), np.uint8))
     area = cv2.dilate(area, np.ones((15,15), np.uint8), iterations=3)
 
-    # Aplica a máscara SEM recortar — mantém o tamanho do frame original
     img_masked = cv2.bitwise_and(img, img, mask=area)
-
     return cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
 
 def detectar_cartas(frame, kp_img, des_img, template_data, reverse_order):
-    caixas_globais = []   # uma lista só, passada para todos os templates
+    caixas_globais = []
 
     for template in (reversed(template_data) if reverse_order else template_data):
-        logger.debug("\t%s: %d keypoints, shape=%s", template['name'],
-                     len(template['kp']), template['img'].shape)
-        n = encontrar_multiplas_instancias(
+        encontrar_multiplas_instancias(
             template['kp'], template['des'],
             kp_img, des_img,
             template['img'], frame,
@@ -266,11 +291,8 @@ def detectar_cartas(frame, kp_img, des_img, template_data, reverse_order):
             ransac_thresh=5.5,
             caixas_globais=caixas_globais,
         )
-        if n > 0:
-            logger.info("\tCarta '%s': %d instância(s) encontrada(s).",
-                        template['name'], n)
-        else:
-            logger.debug("\tCarta '%s': nenhuma instância encontrada.", template['name'])
+
+    return caixas_globais
 
 def cena_nova(anterior, atual):
     if anterior is None or atual is None:
@@ -293,6 +315,22 @@ def main():
     if not cap.isOpened():
         logger.error("Não foi possível acessar o vídeo.")
         return
+
+    largura = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    altura = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = fps if fps > 0 else 30.0
+    output_path = "jogo21_anotado.mp4"
+    video_writer = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (largura, altura),
+    )
+    if not video_writer.isOpened():
+        logger.error("Não foi possível criar o vídeo de saída: %s", output_path)
+        cap.release()
+        return
     
     templates_dir = 'templates/'
     sift = cv2.SIFT_create()
@@ -300,37 +338,32 @@ def main():
     anterior = None
     rodada = 0
     template_data = carregarTemplates(sift, templates_dir)
-    
-    # Variáveis para guardar o último resultado processado
     img_display = None
+    caixas_globais = []
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            logger.warning("Não foi possível capturar o próximo frame; encerrando leitura.")
             break
 
         if cena_nova(anterior, frame):
             rodada += 1
-            logger.info("Rodada %d: nova cena detectada.", rodada)
-
-            # Imagem de trabalho (cinza, recortada) — apenas para o SIFT
             img_trabalho = process_frame(frame, sift, template_data)
-
-            # Imagem de exibição — frame original colorido
-            img_display = frame.copy()
-
-            # Desenha na imagem colorida, mas usando keypoints da imagem de trabalho
             kp_img, des_img = sift.detectAndCompute(img_trabalho, None)
 
-            if rodada == 7 or rodada == 9:
-                detectar_cartas(img_display, kp_img, des_img, template_data, reverse_order=True)
+            if rodada in (7, 9):
+                caixas_globais = detectar_cartas(
+                    frame, kp_img, des_img, template_data, reverse_order=True)
             else:
-                detectar_cartas(img_display, kp_img, des_img, template_data, reverse_order=False)
+                caixas_globais = detectar_cartas(
+                    frame, kp_img, des_img, template_data, reverse_order=False)
+
+        img_display = frame.copy()
+        desenhar_placar_no_frame(img_display, caixas_globais)
+        video_writer.write(img_display)
             
         anterior = frame
 
-        # Exibe a imagem colorida com os contornos
         if img_display is not None:
             cv2.imshow('Jogo', cv2.resize(img_display, (1280, 720)))
         
@@ -338,8 +371,9 @@ def main():
             break
 
     cap.release()
+    video_writer.release()
     cv2.destroyAllWindows()
-
+    logger.info("Vídeo anotado salvo em: %s", output_path)
 
 if __name__ == '__main__':
     main()
