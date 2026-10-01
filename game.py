@@ -1,12 +1,17 @@
 import cv2
 import numpy as np
+import os
+import logging
+
+LIMIAR_CORTE = 8.0
+logger = logging.getLogger(__name__)
 
 def carregarTemplates(sift_detector, templates_directory):
     template_data = []
-    print(f"Procurando templates em: {templates_directory}")
+    logger.info("Procurando templates em: %s", templates_directory)
 
     if not os.path.exists(templates_directory):
-        print(f"Erro: Diretório de templates '{templates_directory}' não encontrado.")
+        logger.error("Diretório de templates '%s' não encontrado.", templates_directory)
         return template_data
 
     for filename in os.listdir(templates_directory):
@@ -16,7 +21,7 @@ def carregarTemplates(sift_detector, templates_directory):
             template_img = cv2.imread(template_path, 0) # Carregar como escala de cinza
 
             if template_img is None:
-                print(f"Não foi possível carregar o template: {template_path}")
+                logger.warning("Não foi possível carregar o template: %s", template_path)
                 continue
 
             kp_template, des_template = sift_detector.detectAndCompute(template_img, None)
@@ -28,15 +33,17 @@ def carregarTemplates(sift_detector, templates_directory):
                     'kp': kp_template,
                     'des': des_template
                 })
-                print(f"Template '{template_name}' carregado com {len(kp_template)} keypoints.")
+                logger.info("Template '%s' carregado com %d keypoints.",
+                            template_name, len(kp_template))
             else:
-                print(f"Não foi possível extrair descritores para o template: {template_name}")
+                logger.warning("Não foi possível extrair descritores para o template: %s",
+                               template_name)
 
-    print(f"Total de {len(template_data)} templates carregados e processados.")
+    logger.info("Total de %d templates carregados e processados.", len(template_data))
     return template_data
 
 def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
-                                   template_img, img_scene_final,
+                                   template_img, img,
                                    template_name="",
                                    min_matches=8, ratio=0.78,
                                    ransac_thresh=5.5,
@@ -58,8 +65,8 @@ def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
         if m.distance < ratio * n.distance and (m.queryIdx, m.trainIdx) in ids_mutuos:
             bons.append(m)
 
-    print(f"  [{template_name}] knn={len(knn)} | mutuos={len(mutuos)} | "
-          f"bons(crosscheck+ratio)={len(bons)} | min={min_matches}")
+    logger.debug("\t[%s] knn=%d | mutuos=%d | bons(crosscheck+ratio)=%d | min=%d",
+                 template_name, len(knn), len(mutuos), len(bons), min_matches)
 
     if len(bons) < min_matches:
         return 0
@@ -69,8 +76,14 @@ def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
 
     indices = list(range(len(bons)))
     caixas_globais = caixas_globais if caixas_globais is not None else []
-    n_inst = 0
+    n_kp_tpl = len(kp_template)
+    LIMIAR_SEGUINTE = 0.25                           # era 0.5
+    TAXA_MIN = 0.4                                  # era 0.55      # 50% do primeiro é suficiente
+
     primeira_inst = True
+    
+    inliers_primeira = None
+    n_inst = 0
     inliers_da_primeira = None
     PALETA = [(0,255,0),(0,0,255),(255,0,0),(0,255,255),(255,0,255),(255,255,0)]
 
@@ -80,28 +93,33 @@ def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
 
         H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransac_thresh)
         if H is None or mask is None:
-            print(f"  [{template_name}] H=None, para")
+            logger.debug("\t\t[%s] H=None, interrompendo busca.", template_name)
             break
 
         inliers = mask.ravel().astype(bool)
         n_in = int(inliers.sum())
         if n_in < min_matches:
+            logger.debug("\t\t[%s] inliers=%d < min_matches=%d, interrompendo busca.",
+                         template_name, n_in, min_matches)
+            break
+
+        taxa_inliers = n_in / max(1, len(src_pts))
+        if taxa_inliers < TAXA_MIN:
+            logger.debug("\t\t[%s] taxa de inliers baixa (%.2f), ignorando.",
+                         template_name, taxa_inliers)
             break
         
         if primeira_inst:
-          if n_in < min_matches:           # exige primeira detecção forte
-              break
-          inliers_da_primeira = n_in
-          primeira_inst = False
+            inliers_primeira = n_in
+            primeira_inst = False
         else:
-          if n_in < 0.6 * inliers_da_primeira:
-              # provavelmente fantasma (invertido ou lixo)
-              # remove e tenta de novo? ou break? → break é mais seguro
-              break
+            # aqui o IoU já bloqueia o espelhamento 180°
+            if n_in < 0.15 * len(bons):
 
-        ok = homografia_plausivel(H, template_img, img_scene_final.shape, 
+                break
+        ok = homografia_plausivel(H, template_img, img.shape, 
                                   debug=True)
-        print(f"  [{template_name}] geom_ok={ok}")
+        logger.debug("\t\t[%s] geom_ok=%s", template_name, ok)
         if not ok:
             break
 
@@ -115,19 +133,24 @@ def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
         
         # ⬇️ NMS GLOBAL: compara com TUDO já aceito
         sobreposto = False
+        
         for (b_old, name_old, inl_old) in caixas_globais:
-            if iou(box, b_old) > 0.3:
+            i = iou(box, b_old)
+            logger.debug("\t\tIoU com %s: %.2f", name_old, i)
+            if i > 0.12:
                 sobreposto = True
                 break
 
         if sobreposto:
             # remove esses inliers e continua procurando outra carta igual de verdade
             indices = [indices[i] for i in range(len(indices)) if not inliers[i]]
+            logger.debug("\t\tBox %s descartado por sobreposição.", box)
             continue
+        logger.debug("\t\tNovo box: %s", box)
 
         caixas_globais.append((box, template_name, n_in))
         cor = PALETA[n_inst % len(PALETA)]
-        desenhaContorno_com_H(H, template_img, img_scene_final, cor,
+        desenhaContorno_com_H(H, template_img, img, cor,
                               label=f"{template_name}#{n_inst+1}")
         n_inst += 1
 
@@ -135,66 +158,56 @@ def encontrar_multiplas_instancias(kp_template, des_template, kp_img, des_img,
 
     return n_inst
 
-def desenhaContorno_com_H(H, template_img, img_scene_final, cor, label=""):
+def homografia_plausivel(H, template_img, scene_shape, debug=False):
+    h, w = template_img.shape[:2]
+    pts = np.float32([[0,0],[w,0],[w,h],[0,h]]).reshape(-1,1,2)
+    dst = cv2.perspectiveTransform(pts, H).reshape(-1,2)
+
+    # ⬇️ teste de convexidade tolerante: só rejeita se MUITO ruim
+    area = abs(cv2.contourArea(dst.astype(np.float32)))
+    hull = cv2.convexHull(dst.astype(np.float32))
+    area_hull = abs(cv2.contourArea(hull))
+    solidez = area / (area_hull + 1e-6)
+    if debug: logger.debug("\t\tGeometria: solidez=%.2f", solidez)
+    if solidez < 0.55:               # era isContourConvex (muito rígido)
+        return False
+
+    ratio_area = area / (w * h)
+    if not (0.25 < ratio_area < 4.0):   # folga que combinamos
+        if debug: logger.debug("\t\tGeometria: area_ratio=%.2f", ratio_area)
+        return False
+
+    def side(p, q): return np.linalg.norm(q - p)
+    w_det = (side(dst[0], dst[1]) + side(dst[3], dst[2])) / 2
+    h_det = (side(dst[0], dst[3]) + side(dst[1], dst[2])) / 2
+    if h_det <= 1:
+        return False
+    ar = (w_det / h_det) / (w / h)
+    if not (0.5 < ar < 2.0):
+        if debug: logger.debug("\t\tGeometria: ar=%.2f", ar)
+        return False
+
+    ih, iw = scene_shape[:2]
+    if dst[:,0].min() < -50 or dst[:,0].max() > iw + 50: return False
+    if dst[:,1].min() < -50 or dst[:,1].max() > ih + 50: return False
+    return True
+
+
+def desenhaContorno_com_H(H, template_img, img, cor, label=""):
     """Desenha o contorno de UMA instância usando a homografia já calculada."""
     if H is None:
         return
     h, w = template_img.shape[:2]
     pts = np.float32([[0, 0], [0, h], [w, h], [w, 0]]).reshape(-1, 1, 2)
     dst = cv2.perspectiveTransform(pts, H)
-    cv2.polylines(img_scene_final, [np.int32(dst)], True, cor, 3)
+    cv2.polylines(img, [np.int32(dst)], True, cor, 3)
 
     # desenha o nome da carta no centro
     if label:
         cx = int(dst[:, 0, 0].mean())
         cy = int(dst[:, 0, 1].mean())
-        cv2.putText(img_scene_final, label, (cx - 30, cy),
+        cv2.putText(img, label, (cx - 30, cy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, cor, 2)
-
-def homografia_plausivel(H, template_img, scene_shape, debug=False):
-    h, w = template_img.shape[:2]
-
-    # Ordem: TL, TR, BR, BL  (consistente com os nomes)
-    pts = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
-    dst = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
-    # dst[0]=TL  dst[1]=TR  dst[2]=BR  dst[3]=BL
-
-    if not cv2.isContourConvex(dst.astype(np.int32)):
-        if debug: print("  geom: não convexo")
-        return False
-
-    area = abs(cv2.contourArea(dst.astype(np.float32)))
-    ratio_area = area / (w * h)
-    # if not (0.3 < ratio_area < 2.5):
-    #     if debug: print(f"  geom: area_ratio={ratio_area:.2f}")
-    #     return False
-
-    def side(p, q): return np.linalg.norm(q - p)
-
-    # Arestas horizontais = topo (TL→TR) e base (BL→BR)
-    w_det = (side(dst[0], dst[1]) + side(dst[3], dst[2])) / 2
-    # Arestas verticais = esquerda (TL→BL) e direita (TR→BR)
-    h_det = (side(dst[0], dst[3]) + side(dst[1], dst[2])) / 2
-
-    if h_det <= 1:
-        if debug: print("  geom: h_det<=1")
-        return False
-
-    ar = (w_det / h_det) / (w / h)
-    if not (0.5 < ar < 2.0):
-        if debug: print(f"  geom: ar={ar:.2f} (w_det={w_det:.0f}, h_det={h_det:.0f})")
-        return False
-
-    ih, iw = scene_shape[:2]
-    if dst[:, 0].min() < -50 or dst[:, 0].max() > iw + 50:
-        if debug: print("  geom: fora horizontalmente")
-        return False
-    if dst[:, 1].min() < -50 or dst[:, 1].max() > ih + 50:
-        if debug: print("  geom: fora verticalmente")
-        return False
-
-    if debug: print(f"  geom OK: ar={ar:.2f}, area_ratio={ratio_area:.2f}")
-    return True
 
 def iou(box1, box2):
     x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
@@ -203,6 +216,14 @@ def iou(box1, box2):
     a1 = (box1[2]-box1[0]) * (box1[3]-box1[1])
     a2 = (box2[2]-box2[0]) * (box2[3]-box2[1])
     return inter / (a1 + a2 - inter + 1e-6)
+
+def min_matches_para(n_kp_tpl):
+    if n_kp_tpl <= 50:
+        return 5      # templates pequenos: aceita menos
+    elif n_kp_tpl < 150:
+        return 6      # templates médios
+    else:
+        return 8      # templates grandes: exige mais
 
 def process_frame(frame, sift_detector, template_data):
     img = frame.copy()
@@ -223,88 +244,97 @@ def process_frame(frame, sift_detector, template_data):
     cv2.drawContours(area, regioes, -1, 255, -1)
     area = cv2.erode(area, np.ones((9, 9), np.uint8))
     area = cv2.dilate(area, np.ones((15,15), np.uint8), iterations=3)
-    min_y_regions = float('inf')
-    max_y_regions = 0
-    min_x_regions = float('inf')
-    max_x_regions = 0
 
-    if regioes: # Ensure regioes is not empty
-        for c in regioes:
-            x, y, w, h = cv2.boundingRect(c)
-            min_y_regions = min(min_y_regions, y)
-            max_y_regions = max(max_y_regions, y + h)
-            min_x_regions = min(min_x_regions, x)
-            max_x_regions = max(max_x_regions, x + w)
-    else:
-        H = 0
-        min_y_regions = 0
-        max_y_regions = img.shape[0] # Fallback to full image height if no regions
-        min_x_regions = 0
-        max_x_regions = img.shape[1] # Fallback to full image width if no regions
-        print("No regions found to calculate H.")
+    # Aplica a máscara SEM recortar — mantém o tamanho do frame original
+    img_masked = cv2.bitwise_and(img, img, mask=area)
 
-    area_BGR = cv2.cvtColor(area, cv2.COLOR_GRAY2BGR)
-    cropped_img = img.copy()
-    cropped_img = cv2.bitwise_and(cropped_img, area_BGR)
-    cropped_img = cropped_img[min_y_regions:max_y_regions, min_x_regions:max_x_regions]
-    return cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
 
-def detectar_cartas(frame, kp_img, des_img, template_data):
-    img_scene_final = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-
+def detectar_cartas(frame, kp_img, des_img, template_data, reverse_order):
     caixas_globais = []   # uma lista só, passada para todos os templates
 
-    for template in template_data:
+    for template in (reversed(template_data) if reverse_order else template_data):
+        logger.debug("\t%s: %d keypoints, shape=%s", template['name'],
+                     len(template['kp']), template['img'].shape)
         n = encontrar_multiplas_instancias(
             template['kp'], template['des'],
             kp_img, des_img,
-            template['img'], img_scene_final,
+            template['img'], frame,
             template_name=template['name'],
-            min_matches=8, 
-            ratio=0.75, 
+            min_matches=min_matches_para(len(template['kp'])),
+            ratio=0.75,
             ransac_thresh=5.5,
             caixas_globais=caixas_globais,
         )
-
         if n > 0:
-            print(f"Carta '{template['name']}': {n} instância(s) encontrada(s).")
+            logger.info("\tCarta '%s': %d instância(s) encontrada(s).",
+                        template['name'], n)
         else:
-            print(f"Carta '{template['name']}': nenhuma instância encontrada.")
+            logger.debug("\tCarta '%s': nenhuma instância encontrada.", template['name'])
+
+def cena_nova(anterior, atual):
+    if anterior is None or atual is None:
+        return True
+    a = cv2.resize(cv2.cvtColor(anterior, cv2.COLOR_BGR2GRAY), (160, 90)).astype(float)
+    b = cv2.resize(cv2.cvtColor(atual, cv2.COLOR_BGR2GRAY), (160, 90)).astype(float)
+    return np.abs(a - b).mean() > LIMIAR_CORTE
 
 def main():
-    cap = cv2.VideoCapture("jogo21.mp4") ## fonte de vídeo (0 para webcam padrão) ou pode ser um arquivo de vídeo, por exemplo: 'video.mp4', lembra de ajustar o path
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="",
+        handlers=[
+            logging.FileHandler("game.log", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+    cap = cv2.VideoCapture("jogo21.mp4")
     if not cap.isOpened():
-        print("Erro: Não foi possível acessar a webcam")
+        logger.error("Não foi possível acessar o vídeo.")
         return
+    
     templates_dir = 'templates/'
-    # Inicializar SIFT
     sift = cv2.SIFT_create()
 
+    anterior = None
+    rodada = 0
     template_data = carregarTemplates(sift, templates_dir)
+    
+    # Variáveis para guardar o último resultado processado
+    img_display = None
 
-    # Calcular keypoints e descritores para a imagem de cena (img) uma única vez
-    kp_img, des_img = sift.detectAndCompute(img, None)
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Erro: Não foi possível capturar o frame")
+            logger.warning("Não foi possível capturar o próximo frame; encerrando leitura.")
             break
-        # frame = cv2.flip(frame, 1)  # espelha o frame horizontalmente
-        # frame = cv2.resize(frame, (640, 480))  # redimensiona o frame para 640x480
+
+        if cena_nova(anterior, frame):
+            rodada += 1
+            logger.info("Rodada %d: nova cena detectada.", rodada)
+
+            # Imagem de trabalho (cinza, recortada) — apenas para o SIFT
+            img_trabalho = process_frame(frame, sift, template_data)
+
+            # Imagem de exibição — frame original colorido
+            img_display = frame.copy()
+
+            # Desenha na imagem colorida, mas usando keypoints da imagem de trabalho
+            kp_img, des_img = sift.detectAndCompute(img_trabalho, None)
+
+            if rodada == 7 or rodada == 9:
+                detectar_cartas(img_display, kp_img, des_img, template_data, reverse_order=True)
+            else:
+                detectar_cartas(img_display, kp_img, des_img, template_data, reverse_order=False)
+            
+        anterior = frame
+
+        # Exibe a imagem colorida com os contornos
+        if img_display is not None:
+            cv2.imshow('Jogo', cv2.resize(img_display, (1280, 720)))
         
-        # Aqui você pode adicionar processamento de imagem
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        # aqui vc exibe o frame processado
-        cv2.imshow('Webcam', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'): # Pressione 'q' para sair
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
